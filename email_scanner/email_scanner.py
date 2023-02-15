@@ -1,3 +1,24 @@
+"""
+邮件扫描工具
+
+使用说明:
+    1. 配置POP3_SERVER_CONFIGS和SCAN_EMAIL_RECEIVED_NO_OLDER_THAN常量
+    2. 针对需要处理的邮件, 实现一个或多个EmailProcessorBase的继承类
+        实现示例参考EmailProcessorExample
+    3. 使用以下代码调用邮件扫描工具
+        es = EmailScanner()
+        es.login()
+        es.start()
+    4. (Optional) 设置定时器以指定时间频率执行3.中所述调用
+
+注意事项:
+    1. 每次执行start会扫描增量邮件(即每封邮件仅处理一次, 邮件的唯一性使用md5算法对邮件的bytes计算校验值进行比对)
+        并记录最新一封邮件的hash值, 用于下次执行时增量比对
+    2. 由于服务器缓存配置的不同, 以及hash log记录可能丢失或被故意删掉以重复扫描已有的邮件, 
+        不保证每封邮件仅会被处理一次, 请在设计EmailProcessor时尽量保证处理流程的idempotent,
+        即使处理流程多次被调用也不会产生异常/创建冗余的数据到数据库/...
+
+"""
 from __future__ import annotations
 
 import email
@@ -9,26 +30,39 @@ import os
 import pathlib
 import poplib
 import re
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Tuple, Callable
 
 import pandas as pd
 from loguru import logger
 
 
 POP3_SERVER_CONFIGS = {
+    # key: server_config_name, values: authorize tokens
     'default': ("USER_NAME", "PASSWORD", "SERVER_ADDRESS"),
+    # 'qqmail': ("1234567890@qq.com", "your_password", "pop.qq.com"),
+    # 'gmail': ("example@gmail.com", "your_password", "pop.gmail.com"),
 }
+"""
+存放多个邮件连接配置, 默认读取default的邮件配置
+如需调用不同名称的配置, 请在EmailScanner实例化时指定server_config_name
+"""
+
 SCAN_EMAIL_RECEIVED_NO_OLDER_THAN = '2023-02-10 19:00:00'
+"""
+在首次扫描时扫描到接收时间早于该时间的即停止, 避免首次执行时间过长
+
+首次扫描: 当前文件所在目录没有batch_history.log文件/文件内容为空
+"""
 
 
-def get_email_access_keys(config_name) -> Tuple[str, str, str]:
+def get_email_access_keys(config_name: str) -> Tuple[str, str, str]:
     access_keys = POP3_SERVER_CONFIGS.get(config_name, None)
     if not access_keys:
         raise Exception(f'no such config: {config_name}')
     return access_keys
 
 
-def read_last_lines_until(file_path, stop_condition) -> List[str]:
+def read_last_lines_until(file_path, stop_condition: Callable) -> List[str]:
     """BUG: 文件多于一行且最后一行为空格时, 会导致死循环"""
     lines = []
     with open(file_path, 'rb') as file:
@@ -82,8 +116,8 @@ class EmailScanner:
     hash_log_header = 'scan_time,last_scaned_email_md5,email_received_time,email_subject'
         # hash_log内csv值对应的含义, 实际记录文件不包含该行（为了方便解析）
 
-    def __init__(self):
-        self.user, self.passwd, self.server_addr = get_email_access_keys('default')
+    def __init__(self, server_config_name='default'):
+        self.user, self.passwd, self.server_addr = get_email_access_keys(server_config_name)
 
     @property
     def last_scanned_email_hash_value(self) -> str:
@@ -111,7 +145,7 @@ class EmailScanner:
         resp, mails, octets = self.server.list()
         return len(mails)
 
-    def get_email_by_index(self, index) -> Email | None:
+    def get_email_by_index(self, index: int) -> Email | None:
         try:
             return Email(self.server, index)
         except:
@@ -125,9 +159,10 @@ class EmailScanner:
         cur_index, cur_hash, cur_email = None, None, None
         latest_index, latest_hash, latest_email = None, None, None # 记录的Email，记录最新一封
         if len(indexes) == 0:
-            logger.warning('POP3服务器无邮件')
+            logger.warning('服务器无邮件')
             return
 
+        # 记录所有解析成功/失败的的邮件
         scanned_emails: List[Tuple[bool, int, pd.Timestamp | None, str]] = []
             # list of tuple of (success, index, received_time, subject)
 
@@ -136,7 +171,7 @@ class EmailScanner:
 
             # 未解析成功
             if my_email is None:
-                scanned_emails.append((False, index, None, '')) # 记录失败的
+                scanned_emails.append((False, index, None, '')) # 记录解析失败的邮件
                 continue
         
             # 超过历史获取限制
@@ -157,7 +192,7 @@ class EmailScanner:
             hint = f'Scaning Email[{index}][{cur_hash[:4]}...{cur_hash[-4:]}] - {received_time_str} - {subject_str}'
             logger.info(hint)
 
-            scanned_emails.append((True, cur_index, cur_email.received_time, cur_email.subject))# 记录成功的
+            scanned_emails.append((True, cur_index, cur_email.received_time, cur_email.subject)) # 记录解析成功的邮件
             yield cur_email
             # self.jot_hash_value(cur_hash, cur_email.received_time, cur_email.subject)
             #   # 记录每一条Note如果使用该方式 日志可能很长
@@ -197,6 +232,7 @@ class EmailScanner:
                 f.write(line + '\n')
 
     def start(self):
+        """开始扫描并处理邮件"""
         processors_classes = EmailProcessorBase.__subclasses__()
         for my_email in self.emails_need_scanned():
             for cls in processors_classes:
@@ -211,11 +247,11 @@ class EmailProcessorBase:
 
     def is_target_email(self, my_email) -> bool:
         """判断当前扫描的Email是否需要被Processor处理"""
-        raise NotImplementedError()
+        raise NotImplementedError('必须实现is_target_email')
 
     def process_email(self, my_email):
         """对is_target_email为True的my_email执行该操作"""
-        raise NotImplementedError()
+        raise NotImplementedError('必须实现process_email')
 
 
 class EmailProcessorExample(EmailProcessorBase):
@@ -242,7 +278,7 @@ class EmailProcessorExample(EmailProcessorBase):
 
     def process_data(self, attachment: EmailAttachment):
         """附件数据处理逻辑"""
-        df = pd.read_excel(attachment.as_BytesIO())
+        df = pd.read_excel(attachment.as_bytes_io())
         print(df.head())
 
     def is_target_attachment(self, attachment):
@@ -344,7 +380,7 @@ class EmailAttachment:
         self.file_name = file_name
         self.file_bytes = file_bytes
 
-    def as_BytesIO(self) -> io.BytesIO:
+    def as_bytes_io(self) -> io.BytesIO:
         return io.BytesIO(self.file_bytes)
 
     def save_to(self, folder: pathlib.Path):
