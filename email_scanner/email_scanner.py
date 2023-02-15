@@ -237,12 +237,13 @@ class EmailProcessorExample(EmailProcessorBase):
             if self.is_target_attachment(attachment):
                 logger.info("Matched Attachment:", attachment.file_name)
                 attachment.save_to(self.attachment_save_folder)
-                self.process_data()
+                self.process_data(attachment)
                 break
 
-    def process_data(self):
+    def process_data(self, attachment: EmailAttachment):
         """附件数据处理逻辑"""
-        pass
+        df = pd.read_excel(attachment.as_BytesIO())
+        print(df.head())
 
     def is_target_attachment(self, attachment):
         attachment_file_name_reg_exp = r"目标附件正则表达式.xlsx"
