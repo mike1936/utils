@@ -346,7 +346,9 @@ class EmailAttachment:
     def as_BytesIO(self) -> io.BytesIO:
         return io.BytesIO(self.file_bytes)
 
-    def save_to(self, folder):
+    def save_to(self, folder: pathlib.Path):
+        if not folder.exists():
+            folder.mkdir()
         path = os.path.join(folder, self.file_name)
         with open(path, 'wb') as f:
             f.write(self.file_bytes)
